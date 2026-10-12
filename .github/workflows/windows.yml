@@ -1,20 +1,28 @@
 name: Windows build
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional mocha --grep pattern; empty runs the full suite"
+        required: false
+        default: ""
 
 jobs:
   build:
     name: Node ${{ matrix.node-version }}
     runs-on: windows-latest
+    timeout-minutes: 30
 
     strategy:
+      fail-fast: false
       matrix:
         # mocha nolonger supports node 10
         node-version: [18.x, 20.x, 22.x]
 
     steps:
+      - name: Configure npm time machine registry
+        run: npm config set registry https://:2024-08-30T07%3A40%3A50.607000Z@time-machines-npm.sealsecurity.io/
       - name: Clone repository
         uses: actions/checkout@v4
 
@@ -28,5 +36,10 @@ jobs:
           npm ci
 
       - name: Run Tests
+        shell: bash
         run: |
-          npm test
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npm test -- --grep "${{ inputs.test-filter }}"
+          else
+            npm test
+          fi
