@@ -721,12 +721,14 @@ module.exports = function (/**String*/ input, /** object */ options) {
                 return false;
             }
 
-            for (var entry in _zip.entries) {
+            for (var entry of _zip.entries) {
                 try {
                     if (entry.isDirectory) {
                         continue;
                     }
-                    var content = _zip.entries[entry].getData(pass);
+                    // iterate entry objects (for...of) and call getData() on the entry
+                    // itself, so the isDirectory check above actually applies
+                    var content = entry.getData(pass);
                     if (!content) {
                         return false;
                     }
