@@ -22,10 +22,11 @@ const u32 = (n) => {
 };
 
 // Build a single-entry zip that declares `declaredSize` uncompressed bytes while
-// only carrying `content` bytes of (crc-invalid) payload.
-function craftBomb(declaredSize, method, content) {
+// only carrying `content` bytes of payload. The crc defaults to 0, which is
+// deliberately wrong (alloc used to happen before the crc check); pass the real
+// crc of the uncompressed data to build an otherwise well-formed entry.
+function craftBomb(declaredSize, method, content, crc = 0) {
     const name = Buffer.from("a");
-    const crc = 0; // deliberately wrong: alloc used to happen before the crc check
     const lfh = Buffer.concat([
         u32(0x04034b50),
         u16(20),
@@ -99,5 +100,129 @@ describe("decompression bomb (declared size) - CVE-2026-39244", () => {
         zip.addFile("d.txt", payload);
         const round = new Zip(zip.toBuffer());
         expect(round.readFile("d.txt").equals(payload)).to.equal(true);
+    });
+});
+
+// Regression test for CVE-2026-92000 (GHSA-c6fg-446q-cg94):
+// the decompression cap from CVE-2026-39244 only reached the sync path. The
+// async path (getDataAsync -> zlib stream) ignores maxOutputLength, so a small
+// deflate stream expanded without limit regardless of the declared size, and a
+// declared uncompressed size of 0 disabled the cap on both paths. Output must be
+// bounded by the declared size on every path, with 0 meaning "empty".
+describe("decompression output cap (async path / zero declared size) - CVE-2026-92000", () => {
+    const zlib = require("zlib");
+    const Utils = require("../util");
+    const nodeMajor = +process.versions.node.split(".")[0];
+
+    // ~1 MB of highly compressible data deflates to ~1 KB: a small amplification bomb
+    const BOMB = Buffer.alloc(1024 * 1024, 0x41);
+    const BOMB_DEFLATED = zlib.deflateRawSync(BOMB);
+    // a valid crc, so without the cap the oversized output would be accepted as-is
+    const BOMB_CRC = Utils.crc32(BOMB);
+
+    // Calls getDataAsync and resolves with every callback invocation seen within a
+    // short window, so tests can assert the callback fires exactly once.
+    function readAsync(entry, cb) {
+        const calls = [];
+        entry.getDataAsync((data, err) => calls.push({ data, err }));
+        setTimeout(() => cb(calls), 200);
+    }
+
+    it("async read rejects output larger than the declared size", (done) => {
+        const zip = new Zip(craftBomb(10, 8 /* DEFLATED */, BOMB_DEFLATED, BOMB_CRC));
+        readAsync(zip.getEntries()[0], (calls) => {
+            try {
+                expect(calls).to.have.lengthOf(1);
+                expect(calls[0].err, "oversized async output must fail").to.be.an("error");
+                expect(calls[0].err.message).to.match(/exceeds the declared uncompressed size/);
+                expect(calls[0].data.length).to.equal(0);
+                done();
+            } catch (e) {
+                done(e);
+            }
+        });
+    });
+
+    it("async read rejects non-empty output when the declared size is 0", (done) => {
+        const zip = new Zip(craftBomb(0, 8 /* DEFLATED */, BOMB_DEFLATED, BOMB_CRC));
+        readAsync(zip.getEntries()[0], (calls) => {
+            try {
+                expect(calls).to.have.lengthOf(1);
+                expect(calls[0].err, "declared size 0 must not disable the cap").to.be.an("error");
+                expect(calls[0].err.message).to.match(/exceeds the declared uncompressed size/);
+                expect(calls[0].data.length).to.equal(0);
+                done();
+            } catch (e) {
+                done(e);
+            }
+        });
+    });
+
+    it("async readFileAsync is capped as well", (done) => {
+        const zip = new Zip(craftBomb(10, 8 /* DEFLATED */, BOMB_DEFLATED, BOMB_CRC));
+        zip.readFileAsync(zip.getEntries()[0], (data, err) => {
+            try {
+                expect(err, "readFileAsync must surface the cap error").to.be.an("error");
+                expect(err.message).to.match(/exceeds the declared uncompressed size/);
+                expect(data.length).to.equal(0);
+                done();
+            } catch (e) {
+                done(e);
+            }
+        });
+    });
+
+    it("sync read rejects non-empty output when the declared size is 0", function () {
+        // the sync cap relies on zlib's maxOutputLength, available from Node 15
+        if (nodeMajor < 15) this.skip();
+        const zip = new Zip(craftBomb(0, 8 /* DEFLATED */, BOMB_DEFLATED, BOMB_CRC));
+        expect(() => zip.getEntries()[0].getData()).to.throw();
+    });
+
+    it("still reads an empty DEFLATED entry declared with size 0", (done) => {
+        const empty = zlib.deflateRawSync(Buffer.alloc(0));
+        const zip = new Zip(craftBomb(0, 8 /* DEFLATED */, empty, 0));
+        const entry = zip.getEntries()[0];
+        expect(entry.getData().length).to.equal(0);
+        readAsync(entry, (calls) => {
+            try {
+                expect(calls).to.have.lengthOf(1);
+                expect(calls[0].err).to.equal(undefined);
+                expect(calls[0].data.length).to.equal(0);
+                done();
+            } catch (e) {
+                done(e);
+            }
+        });
+    });
+
+    it("still reads a legitimate DEFLATED entry asynchronously at exactly its declared size", (done) => {
+        const zip = new Zip(craftBomb(BOMB.length, 8 /* DEFLATED */, BOMB_DEFLATED, BOMB_CRC));
+        readAsync(zip.getEntries()[0], (calls) => {
+            try {
+                expect(calls).to.have.lengthOf(1);
+                expect(calls[0].err).to.equal(undefined);
+                expect(calls[0].data.equals(BOMB)).to.equal(true);
+                done();
+            } catch (e) {
+                done(e);
+            }
+        });
+    });
+
+    it("still round-trips a DEFLATED entry through getDataAsync", (done) => {
+        const payload = Buffer.from("hello world ".repeat(5000));
+        const zip = new Zip();
+        zip.addFile("d.txt", payload);
+        const round = new Zip(zip.toBuffer());
+        round.getEntry("d.txt").getDataAsync((data, err) => {
+            try {
+                expect(err).to.equal(undefined);
+                expect(data.equals(payload)).to.equal(true);
+                done();
+            } catch (e) {
+                done(e);
+            }
+        });
     });
 });
